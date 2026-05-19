@@ -1,0 +1,557 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// AUTHENTICATION & AUTHORIZATION
+// ============================================
+
+enum Role {
+  ADMIN
+  CASHIER
+  WAITER
+  BARISTA
+}
+
+enum Permission {
+  // Order permissions
+  CREATE_ORDER
+  VIEW_ORDER
+  UPDATE_ORDER
+  DELETE_ORDER
+  MERGE_ORDER
+  SPLIT_ORDER
+
+  // Payment permissions
+  CREATE_PAYMENT
+  REFUND_PAYMENT
+  VIEW_PAYMENT
+
+  // Table permissions
+  MANAGE_TABLE
+  VIEW_TABLE
+
+  // Product permissions
+  MANAGE_PRODUCT
+  VIEW_PRODUCT
+
+  // Report permissions
+  VIEW_REPORT
+  EXPORT_REPORT
+
+  // User permissions
+  MANAGE_USER
+  VIEW_USER
+
+  // System permissions
+  MANAGE_SYSTEM
+  VIEW_AUDIT
+}
+
+model Role {
+  id          String       @id @default(cuid())
+  name        Role         @unique
+  displayName String
+  description String?
+  permissions Permission[] @default([])
+  users       User[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@map("roles")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  password      String // bcrypt hashed
+  firstName     String
+  lastName      String
+  phone         String?
+  avatar        String?
+  roleId        String
+  role          Role      @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  isActive      Boolean   @default(true)
+  lastLoginAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Relations
+  orders        Order[]
+  shifts        Shift[]
+  auditLogs     AuditLog[]
+  printJobs     PrintJob[]
+
+  @@index([roleId])
+  @@index([email])
+  @@map("users")
+}
+
+// ============================================
+// TABLES (FLOOR PLAN)
+// ============================================
+
+enum TableStatus {
+  EMPTY
+  OCCUPIED
+  WAITING_FOR_PAYMENT
+  RESERVED
+}
+
+model Table {
+  id          String      @id @default(cuid())
+  tableNumber Int         @unique
+  capacity    Int
+  status      TableStatus @default(EMPTY)
+  qrCode      String? // QR code for ordering
+  notes       String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  // Relations
+  orders      Order[]
+  mergedInto  String? // For merged tables
+  mergedFrom  Table?  @relation("TableMerge", fields: [mergedInto], references: [id], onDelete: SetNull)
+  merges      Table[] @relation("TableMerge")
+
+  @@index([status])
+  @@index([tableNumber])
+  @@map("tables")
+}
+
+// ============================================
+// PRODUCTS & CATEGORIES
+// ============================================
+
+enum ProductStatus {
+  ACTIVE
+  INACTIVE
+  OUT_OF_STOCK
+}
+
+model Category {
+  id          String    @id @default(cuid())
+  name        String    @unique
+  displayName String?
+  description String?
+  image       String?
+  priority    Int       @default(0)
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  // Relations
+  products    Product[]
+
+  @@index([isActive])
+  @@map("categories")
+}
+
+model Product {
+  id            String        @id @default(cuid())
+  name          String
+  description   String?
+  categoryId    String
+  category      Category      @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  price         Decimal       @db.Decimal(10, 2)
+  costPrice     Decimal       @db.Decimal(10, 2)
+  quantity      Int           @default(0) // For inventory
+  image         String?
+  status        ProductStatus @default(ACTIVE)
+  isCombo       Boolean       @default(false)
+  priority      Int           @default(0)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  // Relations
+  orderItems    OrderItem[]
+  comboProducts ComboProduct[]
+  inventory     Inventory[]
+
+  @@index([categoryId])
+  @@index([status])
+  @@map("products")
+}
+
+// ============================================
+// COMBOS & PROMOTIONS
+// ============================================
+
+enum ComboStatus {
+  ACTIVE
+  INACTIVE
+  EXPIRED
+}
+
+model Combo {
+  id          String      @id @default(cuid())
+  name        String      @unique
+  description String?
+  image       String?
+  discount    Decimal     @db.Decimal(10, 2)
+  discountType String     @default("FIXED") // FIXED or PERCENT
+  maxUsage    Int?
+  usageCount  Int         @default(0)
+  status      ComboStatus @default(ACTIVE)
+  startDate   DateTime
+  endDate     DateTime
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  // Relations
+  products    ComboProduct[]
+
+  @@index([status])
+  @@index([startDate, endDate])
+  @@map("combos")
+}
+
+model ComboProduct {
+  id        String   @id @default(cuid())
+  comboId   String
+  combo     Combo    @relation(fields: [comboId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantity  Int      @default(1)
+  createdAt DateTime @default(now())
+
+  @@unique([comboId, productId])
+  @@index([comboId])
+  @@index([productId])
+  @@map("combo_products")
+}
+
+// ============================================
+// ORDERS & ORDER ITEMS
+// ============================================
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PREPARING
+  READY
+  COMPLETED
+  CANCELLED
+  MERGED
+}
+
+enum OrderType {
+  DINE_IN
+  TAKEAWAY
+  DELIVERY
+}
+
+model Order {
+  id              String      @id @default(cuid())
+  orderNumber     String      @unique
+  tableId         String?
+  table           Table?      @relation(fields: [tableId], references: [id], onDelete: SetNull)
+  userId          String
+  user            User        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  type            OrderType   @default(DINE_IN)
+  status          OrderStatus @default(PENDING)
+  
+  // For takeaway/delivery
+  customerName    String?
+  customerPhone   String?
+  deliveryAddress String?
+  deliveryFee     Decimal     @db.Decimal(10, 2) @default(0)
+  
+  // Pricing
+  subtotal        Decimal     @db.Decimal(10, 2)
+  discount        Decimal     @db.Decimal(10, 2) @default(0)
+  tax             Decimal     @db.Decimal(10, 2) @default(0)
+  total           Decimal     @db.Decimal(10, 2)
+  
+  // Notes
+  notes           String?
+  
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  completedAt     DateTime?
+  
+  // Relations
+  items           OrderItem[]
+  payments        Payment[]
+  printJobs       PrintJob[]
+
+  @@index([tableId])
+  @@index([userId])
+  @@index([status])
+  @@index([type])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+enum OrderItemStatus {
+  PENDING
+  CONFIRMED
+  PREPARING
+  READY
+  SERVED
+  CANCELLED
+}
+
+model OrderItem {
+  id              String           @id @default(cuid())
+  orderId         String
+  order           Order            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId       String
+  product         Product          @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantity        Int
+  price           Decimal          @db.Decimal(10, 2)
+  notes           String? // "ít đá", "thêm shot", etc.
+  status          OrderItemStatus  @default(PENDING)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@index([orderId])
+  @@index([productId])
+  @@index([status])
+  @@map("order_items")
+}
+
+// ============================================
+// PAYMENTS
+// ============================================
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  E_WALLET
+  VIET_QR
+}
+
+enum PaymentStatus {
+  PENDING
+  CONFIRMED
+  COMPLETED
+  FAILED
+  REFUNDED
+}
+
+model Payment {
+  id              String        @id @default(cuid())
+  orderId         String
+  order           Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  amount          Decimal       @db.Decimal(10, 2)
+  method          PaymentMethod @default(VIET_QR)
+  status          PaymentStatus @default(PENDING)
+  
+  // VietQR specific fields
+  vietqrId        String? // Unique ID from Napas
+  vietqrData      String? // Raw QR data
+  qrContent       String? // QR image content (base64)
+  bankInfo        Json? // Bank details {bankId, bankName, accountNo}
+  transactionRef  String? // Reference for webhook validation
+  qrExpiredAt     DateTime?
+  
+  // Other payment details
+  reference       String? // Reference code/number
+  notes           String?
+  
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  completedAt     DateTime?
+
+  @@index([orderId])
+  @@index([status])
+  @@index([method])
+  @@index([createdAt])
+  @@map("payments")
+}
+
+// ============================================
+// CUSTOMERS
+// ============================================
+
+model Customer {
+  id            String   @id @default(cuid())
+  name          String
+  phone         String   @unique
+  email         String?
+  address       String?
+  loyaltyPoints Int      @default(0)
+  totalSpent    Decimal  @db.Decimal(10, 2) @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([phone])
+  @@map("customers")
+}
+
+// ============================================
+// PRINTERS
+// ============================================
+
+enum PrinterType {
+  THERMAL_58MM
+  THERMAL_80MM
+  NETWORK
+  BLUETOOTH
+}
+
+enum PrinterStatus {
+  ONLINE
+  OFFLINE
+  ERROR
+}
+
+model Printer {
+  id          String        @id @default(cuid())
+  name        String        @unique
+  type        PrinterType
+  ipAddress   String?
+  port        Int?
+  macAddress  String?
+  status      PrinterStatus @default(OFFLINE)
+  purpose     String? // KITCHEN, BAR, RECEIPT, etc.
+  isActive    Boolean       @default(true)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  // Relations
+  printJobs   PrintJob[]
+
+  @@index([type])
+  @@index([status])
+  @@map("printers")
+}
+
+enum PrintJobStatus {
+  PENDING
+  PRINTING
+  COMPLETED
+  FAILED
+}
+
+model PrintJob {
+  id          String        @id @default(cuid())
+  orderId     String
+  order       Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  printerId   String
+  printer     Printer       @relation(fields: [printerId], references: [id], onDelete: Restrict)
+  userId      String
+  user        User          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  content     String // ESC/POS commands or raw text
+  status      PrintJobStatus @default(PENDING)
+  attempts    Int           @default(0)
+  lastError   String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([orderId])
+  @@index([printerId])
+  @@index([status])
+  @@map("print_jobs")
+}
+
+// ============================================
+// INVENTORY
+// ============================================
+
+model Inventory {
+  id          String   @id @default(cuid())
+  productId   String   @unique
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantity    Int
+  minQuantity Int      @default(5)
+  maxQuantity Int?
+  unit        String   @default("piece") // piece, liter, kg, etc.
+  lastRestockAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([productId])
+  @@map("inventory")
+}
+
+// ============================================
+// SHIFTS & ATTENDANCE
+// ============================================
+
+enum ShiftStatus {
+  OPENED
+  CLOSED
+}
+
+model Shift {
+  id          String      @id @default(cuid())
+  userId      String
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status      ShiftStatus @default(OPENED)
+  openedAt    DateTime    @default(now())
+  closedAt    DateTime?
+  openingCash Decimal     @db.Decimal(10, 2)
+  closingCash Decimal     @db.Decimal(10, 2) @default(0)
+  notes       String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([openedAt])
+  @@map("shifts")
+}
+
+// ============================================
+// AUDIT & COMPLIANCE
+// ============================================
+
+enum AuditAction {
+  CREATE
+  READ
+  UPDATE
+  DELETE
+  LOGIN
+  LOGOUT
+  PAYMENT_RECEIVED
+  ORDER_COMPLETED
+  REPORT_GENERATED
+}
+
+model AuditLog {
+  id          String      @id @default(cuid())
+  userId      String
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  action      AuditAction
+  resource    String // e.g., "Order", "Payment", "User"
+  resourceId  String
+  oldValues   Json?
+  newValues   Json?
+  userIp      String?
+  userAgent   String?
+  createdAt   DateTime    @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([resource])
+  @@index([resourceId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ============================================
+// SYSTEM CONFIGURATION
+// ============================================
+
+model SystemConfig {
+  id                String   @id @default(cuid())
+  key               String   @unique
+  value             String
+  description       String?
+  lastModifiedBy    String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([key])
+  @@map("system_configs")
+}
